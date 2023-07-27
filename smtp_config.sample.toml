@@ -1,0 +1,3 @@
+smtp_host = "smtp.gmail.com"
+smtp_user = "email@gmail.com"
+smtp_password = "gmail password"
