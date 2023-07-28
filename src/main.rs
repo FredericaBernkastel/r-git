@@ -1,23 +1,26 @@
+#![allow(unused_labels)]
+
 use std::mem::MaybeUninit;
 use std::pin::pin;
-use std::sync::{Arc, RwLock};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{
+  self, atomic::{AtomicBool}
+};
 use std::time::Duration;
 use eframe::egui::{Align2, Ui};
 use r::{Mailer, Submission};
 use ringbuf::{Rb, SharedRb};
 use {
   anyhow::Result,
-  eframe::egui::{self, Label, RichText, KeyboardShortcut, Modifiers, Key},
-  futures::{Stream, StreamExt},
+  eframe::egui::{self, RichText, KeyboardShortcut, Modifiers, Key},
+  futures::{StreamExt},
   std::{
     thread::{self, JoinHandle},
   },
 };
 
 struct RedditWatcher {
-  reddit_watcher: Arc<r::RedditWatcher>,
-  thread: JoinHandle<()>,
+  watcher: Arc<r::RedditWatcher>,
   watcher_enabled: Arc<AtomicBool>,
   last_posts: Arc<RwLock<SharedRb<Submission, Vec<MaybeUninit<Submission>>>>>
 }
@@ -46,7 +49,7 @@ fn main() -> Result<()> {
 
 struct GUI {
   reddit_watcher: RedditWatcher,
-  mailer: Arc<Option<Mailer>>,
+  mailer: Arc<OnceLock<Mailer>>,
 
   subreddit_filter_enabled: bool,
   subreddit_filter: String,
@@ -55,7 +58,14 @@ struct GUI {
   email_enabled: bool,
   email_address: String,
 
-  popup_error: (bool, String)
+  reddit_fetch_interval: f64,
+  subreddit_fetch_interval: f64,
+  email_send_interval: f64,
+  email_max_submissions_per_letter: usize,
+  email_min_submissions_per_letter: usize,
+
+  popup_error: (bool, String),
+  popup_settings: bool,
 }
 
 impl GUI {
@@ -70,14 +80,14 @@ impl GUI {
     let ctx = cc.egui_ctx.clone();
     let watcher_enabled = Arc::new(AtomicBool::new(false));
 
-    let mailer = Arc::new(Mailer::new(r::Settings {
-      subreddit: None,
-      submission_filter_regex: None,
-      notify_email: None,
-    }).ok());
+    let mailer = Arc::new(OnceLock ::new());
+
+    Mailer::new(r::Settings::default())
+      .map(|m| mailer.set(m).ok().unwrap())
+      .ok();
     Mailer::start_thread(mailer.clone());
 
-    let thread = submissions_thread(
+    let _watcher_thread = submissions_thread(
       reddit_watcher.clone(),
       last_posts.clone(),
       watcher_enabled.clone(),
@@ -86,8 +96,7 @@ impl GUI {
     );
 
     let reddit_watcher = RedditWatcher {
-      reddit_watcher,
-      thread,
+      watcher: reddit_watcher,
       watcher_enabled,
       last_posts
     };
@@ -103,7 +112,14 @@ impl GUI {
       email_enabled: false,
       email_address: "email@example.com".to_string(),
 
-      popup_error: (false, "".to_string())
+      reddit_fetch_interval: 10.0,
+      subreddit_fetch_interval: 60.0,
+      email_send_interval: 10.0,
+      email_max_submissions_per_letter: 200,
+      email_min_submissions_per_letter: 1,
+
+      popup_error: (false, "".to_string()),
+      popup_settings: false
     })
   }
 
@@ -123,22 +139,35 @@ impl GUI {
           })
       }).ok();
   }
+  
+  fn fetch_ui_settings(&self) -> r::Settings {
+    r::Settings {
+      subreddit: self.subreddit_filter_enabled.then_some(self.subreddit_filter.clone()),
+      submission_filter_regex: self.title_filter_enabled.then_some(self.title_filter.clone()),
+      notify_email: Some(self.email_address.clone()),
+      reddit_fetch_interval: Some(self.reddit_fetch_interval),
+      subreddit_fetch_interval: Some(self.subreddit_fetch_interval),
+      email_send_interval: Some(self.email_send_interval),
+      email_max_submissions_per_letter: Some(self.email_max_submissions_per_letter),
+      email_min_submissions_per_letter: Some(self.email_min_submissions_per_letter),
+    }
+  }
 
-  fn show_error_popup(&mut self, message: String) {
+  fn show_error(&mut self, message: String) {
     self.popup_error = (true, message)
   }
 
   fn on_start_click(&mut self) {
-    self.reddit_watcher.watcher_enabled.store(!self.reddit_watcher.watcher_enabled.load(Ordering::Relaxed), Ordering::Relaxed);
+    self.reddit_watcher.watcher_enabled.store(!self.reddit_watcher.watcher_enabled.load(sync::atomic::Ordering::Relaxed), sync::atomic::Ordering::Relaxed);
   }
 
   fn on_subreddit_filter_changed(&mut self) {
-    self.reddit_watcher.reddit_watcher
+    self.reddit_watcher.watcher
       .with_subredit_filter(self.subreddit_filter_enabled.then_some(self.subreddit_filter.clone()));
   }
 
   fn on_title_filter_changed(&mut self) {
-    self.reddit_watcher.reddit_watcher
+    self.reddit_watcher.watcher
       .with_title_filter(self.title_filter_enabled.then(||
         regex::Regex::new(&self.title_filter)
           .map_err(|e| log::error!("Failed to comile regex: {e:?}"))
@@ -149,25 +178,20 @@ impl GUI {
   fn on_email_checkbox_changed(&mut self) {
     match self.email_enabled {
       false => {
-        (*self.mailer).as_ref().map(|m| {
+        self.mailer.get().map(|m| {
           m.env_settings.write().unwrap().notify_email = None;
         });
       },
-      true => if self.mailer.is_none() {
-        let mailer = r::Mailer::new(r::Settings {
-          subreddit: self.subreddit_filter_enabled.then_some(self.subreddit_filter.clone()),
-          submission_filter_regex: self.title_filter_enabled.then_some(self.title_filter.clone()),
-          notify_email: Some(self.email_address.clone()),
-        });
+      true => if self.mailer.get().is_none() {
+        let mailer = Mailer::new(self.fetch_ui_settings());
 
         match mailer {
           Ok(m) => {
-            self.mailer = Arc::new(Some(m));
-            let thr = Mailer::start_thread(self.mailer.clone());
+            self.mailer.set(m).ok();
           },
           Err(e) => {
             self.email_enabled = false;
-            self.show_error_popup(e.to_string());
+            self.show_error(e.to_string());
           }
         };
       } else {
@@ -177,20 +201,12 @@ impl GUI {
   }
 
   fn on_email_address_changed(&mut self) {
-    (*self.mailer).as_ref().map(|m| {
-      let env_settings = r::Settings {
-        subreddit: self.subreddit_filter_enabled.then_some(self.subreddit_filter.clone()),
-        submission_filter_regex: self.title_filter_enabled.then_some(self.title_filter.clone()),
-        notify_email: Some(self.email_address.clone()),
-      };
-      *m.env_settings.write().unwrap() = env_settings;
+    self.mailer.get().map(|m| {
+      *m.env_settings.write().unwrap() = self.fetch_ui_settings();
     });
   }
-}
 
-impl eframe::App for GUI {
-  fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
-    // show popups
+  fn window_error(&mut self, ctx: &egui::Context) {
     egui::Window::new(RichText::new("⚠ Error").color(egui::Color32::from_rgb(255, 192, 0)))
       .open(&mut self.popup_error.0)
       .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
@@ -198,7 +214,83 @@ impl eframe::App for GUI {
       .show(ctx, |ui| {
         ui.label(RichText::new(&self.popup_error.1).monospace());
       });
+  }
 
+  fn window_extra_settings(&mut self, ctx: &egui::Context) {
+    egui::Window::new(RichText::new("🔧 Extra settings"))
+      .open(&mut self.popup_settings)
+      .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+      .show(ctx, |ui| {
+        egui::Grid::new("my_grid")
+          .num_columns(2)
+          .spacing([40.0, 4.0])
+          .striped(true)
+          .show(ui, |ui| {
+            ui.label("reddit_fetch_interval");
+            ui.add(egui::DragValue::new(&mut self.reddit_fetch_interval).speed(0.1)
+              .suffix("s")
+              .clamp_range(1.0..=60.0)
+            ) .changed()
+              .then(|| {
+                self.reddit_watcher.watcher.with_reddit_fetch_interval(Duration::from_secs_f64(self.reddit_fetch_interval));
+              });
+            ui.end_row();
+
+            ui.label("subreddit_fetch_interval");
+            ui.add(egui::DragValue::new(&mut self.subreddit_fetch_interval).speed(0.5)
+              .suffix("s")
+              .clamp_range(1.0..=300.0)
+            ) .changed()
+              .then(|| {
+                self.reddit_watcher.watcher.with_subreddit_fetch_interval(Duration::from_secs_f64(self.subreddit_fetch_interval));
+              });
+            ui.end_row();
+
+            ui.separator();
+            ui.end_row();
+
+            ui.label("email_send_interval");
+            ui.add(egui::DragValue::new(&mut self.email_send_interval).speed(0.5)
+              .suffix("m")
+              .clamp_range(1.0..=300.0)
+            ) .changed()
+              .then(|| {
+                self.mailer.get()
+                  .map(|m| m.env_settings.write().unwrap().email_send_interval
+                    = Some(self.email_send_interval));
+              });
+            ui.end_row();
+
+            ui.label("email_max_submissions_per_letter");
+            ui.add(egui::DragValue::new(&mut self.email_max_submissions_per_letter).speed(0.1)
+              .clamp_range(1..=1000)
+            ) .changed()
+              .then(|| {
+                self.mailer.get()
+                  .map(|m| m.env_settings.write().unwrap().email_max_submissions_per_letter
+                    = Some(self.email_max_submissions_per_letter));
+              });
+            ui.end_row();
+
+            ui.label("email_min_submissions_per_letter");
+            ui.add(egui::DragValue::new(&mut self.email_min_submissions_per_letter).speed(0.1)
+              .clamp_range(1..=1000)
+            ) .changed()
+              .then(|| {
+                self.mailer.get()
+                  .map(|m| m.env_settings.write().unwrap().email_min_submissions_per_letter
+                    = Some(self.email_min_submissions_per_letter));
+              });
+          });
+      });
+  }
+}
+
+impl eframe::App for GUI {
+  fn update(&mut self, ctx: &egui::Context, _: &mut eframe::Frame) {
+    // show popups
+    self.window_error(ctx);
+    self.window_extra_settings(ctx);
 
     egui::TopBottomPanel::top("control buttons").show(ctx, |ui| {
       ui.add_space(1.0);
@@ -207,7 +299,7 @@ impl eframe::App for GUI {
         ui.style_mut().visuals.button_frame = false;
 
         (
-          ui.button(if !self.reddit_watcher.watcher_enabled.load(Ordering::Relaxed) { "▶ Start Watcher" } else { "⏸ Stop Watcher" })
+          ui.button(if !self.reddit_watcher.watcher_enabled.load(sync::atomic::Ordering::Relaxed) { "▶ Start Watcher" } else { "⏸ Stop Watcher" })
             .on_hover_text_at_pointer("S")
             .clicked() || ui.input_mut(|i| i.consume_shortcut(&KeyboardShortcut { modifiers: Modifiers::NONE, key: Key::Space }))
         ).then(|| self.on_start_click());
@@ -257,6 +349,12 @@ impl eframe::App for GUI {
           .changed()
           .then(|| self.on_email_address_changed())
       );
+
+      ui.add_space(10.0);
+      ui.separator();
+      ui.add_space(10.0);
+
+      ui.checkbox(&mut self.popup_settings, "🔧 Extra settings");
     });
 
     egui::CentralPanel::default().show(ctx, |ui| {
@@ -272,7 +370,7 @@ pub fn submissions_thread(
   post_ring_buffer: Arc<RwLock<SharedRb<Submission, Vec<MaybeUninit<Submission>>>>>,
   watcher_enabled: Arc<AtomicBool>,
   on_new_post_callback: impl Fn(Submission) + Send + 'static,
-  mailer: Arc<Option<Mailer>>
+  mailer: Arc<OnceLock<Mailer>>
 ) -> JoinHandle<()> {
   let runtime = tokio::runtime::Builder::new_current_thread()
     .enable_all()
@@ -282,24 +380,24 @@ pub fn submissions_thread(
   thread::spawn(move || {
     runtime.block_on(async move {
       'command: loop {
-        if watcher_enabled.load(Ordering::Relaxed) { // receive enable signal
+        if watcher_enabled.load(sync::atomic::Ordering::Relaxed) { // receive enable signal
           let mut stream = pin!(reddit_watcher.stream_submissions().await);
           'stream: while let Some(submission) = stream.next().await {
-            if !watcher_enabled.load(Ordering::Relaxed) { // receive disable signal
+            if !watcher_enabled.load(sync::atomic::Ordering::Relaxed) { // receive disable signal
               break 'stream;
             };
             post_ring_buffer.write()
               .unwrap()
               .push_overwrite(submission.clone());
 
-            (*mailer).as_ref()
+            mailer.get()
               .map(|m| m.add_submission_to_queue(submission.clone()));
 
             tokio::time::sleep(Duration::from_millis(16)).await; // smooth scroll, can be removed
             on_new_post_callback(submission); // call ui thread to redraw post list
           };
         } else {
-          thread::sleep(Duration::from_millis(250));
+          tokio::time::sleep(Duration::from_millis(250)).await;
         }
       }
     });
