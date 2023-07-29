@@ -1,22 +1,21 @@
 #![allow(unused_labels)]
 
-use std::mem::MaybeUninit;
-use std::pin::pin;
-use std::sync::{Arc, OnceLock, RwLock};
-use std::sync::{
-  self, atomic::{AtomicBool}
-};
-use std::time::Duration;
-use eframe::egui::{Align2, Ui};
-use r::{Mailer, Submission};
-use ringbuf::{Rb, SharedRb};
 use {
-  anyhow::Result,
-  eframe::egui::{self, RichText, KeyboardShortcut, Modifiers, Key},
-  futures::{StreamExt},
   std::{
-    thread::{self, JoinHandle},
+    mem::MaybeUninit,
+    pin::pin,
+    sync::{self, Arc, OnceLock, RwLock, atomic::AtomicBool},
+    time::Duration,
+    thread::{self, JoinHandle}
   },
+  futures::StreamExt,
+  eframe::{
+    egui::{self, Align2, Ui, RichText, KeyboardShortcut, Modifiers, Key},
+    Storage
+  },
+  ringbuf::{Rb, SharedRb},
+  anyhow::Result,
+  r::{Mailer, Submission},
 };
 
 struct RedditWatcher {
@@ -40,7 +39,7 @@ fn main() -> Result<()> {
   };
 
   eframe::run_native(
-    "My egui App",
+    "reddit_watcher",
     native_options,
     Box::new(|cc| Box::new(GUI::new(cc).unwrap()))
   ).unwrap();
@@ -48,9 +47,23 @@ fn main() -> Result<()> {
 }
 
 struct GUI {
+  state: GUIState,
+
   reddit_watcher: RedditWatcher,
   mailer: Arc<OnceLock<Mailer>>,
 
+  popup_error: (bool, String),
+  popup_settings: bool,
+
+  pupup_gui_settings: bool,
+  pupup_gui_inspection: bool,
+  pupup_gui_memory: bool,
+
+  texture: Option<egui_extras::RetainedImage>
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct GUIState {
   subreddit_filter_enabled: bool,
   subreddit_filter: String,
   title_filter_enabled: bool,
@@ -63,48 +76,11 @@ struct GUI {
   email_send_interval: f64,
   email_max_submissions_per_letter: usize,
   email_min_submissions_per_letter: usize,
-
-  popup_error: (bool, String),
-  popup_settings: bool,
 }
 
-impl GUI {
-  fn new(cc: &eframe::CreationContext<'_>) -> Result<Self> {
-    // Customize egui here with cc.egui_ctx.set_fonts and cc.egui_ctx.set_visuals.
-    // Restore app state using cc.storage (requires the "persistence" feature).
-    // Use the cc.gl (a glow::Context) to create graphics shaders and buffers that you can use
-    // for e.g. egui::PaintCallback.
-
-    let reddit_watcher = Arc::new(r::RedditWatcher::new()?);
-    let last_posts = Arc::new(RwLock::new(ringbuf::HeapRb::new(200)));
-    let ctx = cc.egui_ctx.clone();
-    let watcher_enabled = Arc::new(AtomicBool::new(false));
-
-    let mailer = Arc::new(OnceLock ::new());
-
-    Mailer::new(r::Settings::default())
-      .map(|m| mailer.set(m).ok().unwrap())
-      .ok();
-    Mailer::start_thread(mailer.clone());
-
-    let _watcher_thread = submissions_thread(
-      reddit_watcher.clone(),
-      last_posts.clone(),
-      watcher_enabled.clone(),
-      move |_| ctx.request_repaint(),
-        mailer.clone()
-    );
-
-    let reddit_watcher = RedditWatcher {
-      watcher: reddit_watcher,
-      watcher_enabled,
-      last_posts
-    };
-
-    Ok(Self {
-      reddit_watcher,
-      mailer,
-
+impl Default for GUIState {
+  fn default() -> Self {
+    Self {
       subreddit_filter_enabled: false,
       subreddit_filter: "AskReddit".to_string(),
       title_filter_enabled: false,
@@ -117,9 +93,77 @@ impl GUI {
       email_send_interval: 10.0,
       email_max_submissions_per_letter: 200,
       email_min_submissions_per_letter: 1,
+    }
+  }
+}
+
+impl From<GUIState> for r::Settings {
+  fn from(value: GUIState) -> Self {
+    Self {
+      subreddit: value.subreddit_filter_enabled.then_some(value.subreddit_filter.clone()),
+      submission_filter_regex: value.title_filter_enabled.then_some(value.title_filter.clone()),
+      notify_email: value.email_enabled.then_some(value.email_address.clone()),
+      reddit_fetch_interval: Some(value.reddit_fetch_interval),
+      subreddit_fetch_interval: Some(value.subreddit_fetch_interval),
+      email_send_interval: Some(value.email_send_interval),
+      email_max_submissions_per_letter: Some(value.email_max_submissions_per_letter),
+      email_min_submissions_per_letter: Some(value.email_min_submissions_per_letter),
+    }
+  }
+}
+
+impl GUI {
+  fn new(cc: &eframe::CreationContext<'_>) -> Result<Self> {
+    let gui_state = cc.storage
+      .and_then(|s| s.get_string("state"))
+      .and_then(|json| serde_json::from_str::<GUIState>(&json).ok())
+      .unwrap_or_default();
+
+    let reddit_watcher = Arc::new(r::RedditWatcher::new(gui_state.clone().into())?);
+    let last_posts = Arc::new(RwLock::new(ringbuf::HeapRb::new(200)));
+    let watcher_enabled = Arc::new(AtomicBool::new(false));
+
+    let mailer = Arc::new(OnceLock ::new());
+
+    Mailer::new(gui_state.clone().into())
+      .map(|m| mailer.set(m).ok().unwrap())
+      .ok();
+    Mailer::start_thread(mailer.clone());
+
+    let _watcher_thread = submissions_thread(
+      reddit_watcher.clone(),
+      last_posts.clone(),
+      watcher_enabled.clone(),
+      {
+        let ctx = cc.egui_ctx.clone();
+        move |_| ctx.request_repaint()
+      },
+        mailer.clone()
+    );
+
+    let reddit_watcher = RedditWatcher {
+      watcher: reddit_watcher,
+      watcher_enabled,
+      last_posts
+    };
+
+    let texture = egui_extras::RetainedImage::from_image_bytes("rika", include_bytes!("../img/rika.png"))
+      .ok();
+
+    Ok(Self {
+      reddit_watcher,
+      mailer,
+
+      state: gui_state,
 
       popup_error: (false, "".to_string()),
-      popup_settings: false
+      popup_settings: false,
+
+      pupup_gui_settings: false,
+      pupup_gui_inspection: false,
+      pupup_gui_memory: false,
+
+      texture
     })
   }
 
@@ -139,19 +183,6 @@ impl GUI {
           })
       }).ok();
   }
-  
-  fn fetch_ui_settings(&self) -> r::Settings {
-    r::Settings {
-      subreddit: self.subreddit_filter_enabled.then_some(self.subreddit_filter.clone()),
-      submission_filter_regex: self.title_filter_enabled.then_some(self.title_filter.clone()),
-      notify_email: Some(self.email_address.clone()),
-      reddit_fetch_interval: Some(self.reddit_fetch_interval),
-      subreddit_fetch_interval: Some(self.subreddit_fetch_interval),
-      email_send_interval: Some(self.email_send_interval),
-      email_max_submissions_per_letter: Some(self.email_max_submissions_per_letter),
-      email_min_submissions_per_letter: Some(self.email_min_submissions_per_letter),
-    }
-  }
 
   fn show_error(&mut self, message: String) {
     self.popup_error = (true, message)
@@ -163,34 +194,34 @@ impl GUI {
 
   fn on_subreddit_filter_changed(&mut self) {
     self.reddit_watcher.watcher
-      .with_subredit_filter(self.subreddit_filter_enabled.then_some(self.subreddit_filter.clone()));
+      .with_subredit_filter(self.state.subreddit_filter_enabled.then_some(self.state.subreddit_filter.clone()));
   }
 
   fn on_title_filter_changed(&mut self) {
     self.reddit_watcher.watcher
-      .with_title_filter(self.title_filter_enabled.then(||
-        regex::Regex::new(&self.title_filter)
+      .with_title_filter(self.state.title_filter_enabled.then(||
+        regex::Regex::new(&self.state.title_filter)
           .map_err(|e| log::error!("Failed to comile regex: {e:?}"))
           .ok()
       ).flatten())
   }
 
   fn on_email_checkbox_changed(&mut self) {
-    match self.email_enabled {
+    match self.state.email_enabled {
       false => {
         self.mailer.get().map(|m| {
           m.env_settings.write().unwrap().notify_email = None;
         });
       },
       true => if self.mailer.get().is_none() {
-        let mailer = Mailer::new(self.fetch_ui_settings());
+        let mailer = Mailer::new(self.state.clone().into());
 
         match mailer {
           Ok(m) => {
             self.mailer.set(m).ok();
           },
           Err(e) => {
-            self.email_enabled = false;
+            self.state.email_enabled = false;
             self.show_error(e.to_string());
           }
         };
@@ -202,7 +233,7 @@ impl GUI {
 
   fn on_email_address_changed(&mut self) {
     self.mailer.get().map(|m| {
-      *m.env_settings.write().unwrap() = self.fetch_ui_settings();
+      *m.env_settings.write().unwrap() = self.state.clone().into();
     });
   }
 
@@ -217,71 +248,115 @@ impl GUI {
   }
 
   fn window_extra_settings(&mut self, ctx: &egui::Context) {
+    egui::Window::new("🔧 GUI Settings")
+      .open(&mut self.pupup_gui_settings)
+      .vscroll(true)
+      .show(ctx, |ui| {
+        ctx.settings_ui(ui);
+      });
+
+    egui::Window::new("🔍 GUI Inspection")
+      .open(&mut self.pupup_gui_inspection)
+      .vscroll(true)
+      .show(ctx, |ui| {
+        ctx.inspection_ui(ui);
+      });
+
+    egui::Window::new("📝 GUI Memory")
+      .open(&mut self.pupup_gui_memory)
+      .resizable(false)
+      .show(ctx, |ui| {
+        ctx.memory_ui(ui);
+      });
+
     egui::Window::new(RichText::new("🔧 Extra settings"))
       .open(&mut self.popup_settings)
       .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+      .default_width(270.0)
       .show(ctx, |ui| {
         egui::Grid::new("my_grid")
           .num_columns(2)
           .spacing([40.0, 4.0])
           .striped(true)
           .show(ui, |ui| {
-            ui.label("reddit_fetch_interval");
-            ui.add(egui::DragValue::new(&mut self.reddit_fetch_interval).speed(0.1)
-              .suffix("s")
-              .clamp_range(1.0..=60.0)
-            ) .changed()
-              .then(|| {
-                self.reddit_watcher.watcher.with_reddit_fetch_interval(Duration::from_secs_f64(self.reddit_fetch_interval));
-              });
+            (
+              ui.label("reddit_fetch_interval") |
+              ui.add(egui::DragValue::new(&mut self.state.reddit_fetch_interval).speed(0.1)
+                .suffix("s")
+                .clamp_range(1.0..=60.0)
+              )
+            ) .on_hover_text_at_pointer("Interval to fetch new posts.\nDefault: 10s")
+              .changed()
+              .then(|| self.reddit_watcher.watcher.with_reddit_fetch_interval(Duration::from_secs_f64(self.state.reddit_fetch_interval)));
             ui.end_row();
 
-            ui.label("subreddit_fetch_interval");
-            ui.add(egui::DragValue::new(&mut self.subreddit_fetch_interval).speed(0.5)
-              .suffix("s")
-              .clamp_range(1.0..=300.0)
-            ) .changed()
+            (
+              ui.label("subreddit_fetch_interval") |
+              ui.add(egui::DragValue::new(&mut self.state.subreddit_fetch_interval).speed(0.5)
+                .suffix("s")
+                .clamp_range(1.0..=300.0)
+              )
+            ) .on_hover_text_at_pointer("Interval to fetch new posts, if subreddit filter enabled.\nDefault: 60s")
+              .changed()
               .then(|| {
-                self.reddit_watcher.watcher.with_subreddit_fetch_interval(Duration::from_secs_f64(self.subreddit_fetch_interval));
+                self.reddit_watcher.watcher.with_subreddit_fetch_interval(Duration::from_secs_f64(self.state.subreddit_fetch_interval));
               });
             ui.end_row();
 
             ui.separator();
             ui.end_row();
 
-            ui.label("email_send_interval");
-            ui.add(egui::DragValue::new(&mut self.email_send_interval).speed(0.5)
-              .suffix("m")
-              .clamp_range(1.0..=300.0)
-            ) .changed()
+            (
+              ui.label("email_send_interval") |
+              ui.add(egui::DragValue::new(&mut self.state.email_send_interval).speed(0.5)
+                .suffix("m")
+                .clamp_range(1.0..=300.0)
+              )
+            ) .on_hover_text_at_pointer("Send a email at least once per interval.\nDefault: 10 minutes")
+              .changed()
               .then(|| {
                 self.mailer.get()
                   .map(|m| m.env_settings.write().unwrap().email_send_interval
-                    = Some(self.email_send_interval));
+                    = Some(self.state.email_send_interval));
               });
             ui.end_row();
 
-            ui.label("email_max_submissions_per_letter");
-            ui.add(egui::DragValue::new(&mut self.email_max_submissions_per_letter).speed(0.1)
-              .clamp_range(1..=1000)
-            ) .changed()
+            (
+              ui.label("email_max_submissions_per_letter") |
+              ui.add(egui::DragValue::new(&mut self.state.email_max_submissions_per_letter).speed(0.1)
+                .clamp_range(1..=1000)
+              )
+            ) .on_hover_text_at_pointer("Maximum number of submissions per letter.\nDefault: 200")
+              .changed()
               .then(|| {
                 self.mailer.get()
                   .map(|m| m.env_settings.write().unwrap().email_max_submissions_per_letter
-                    = Some(self.email_max_submissions_per_letter));
+                    = Some(self.state.email_max_submissions_per_letter));
               });
             ui.end_row();
 
-            ui.label("email_min_submissions_per_letter");
-            ui.add(egui::DragValue::new(&mut self.email_min_submissions_per_letter).speed(0.1)
-              .clamp_range(1..=1000)
-            ) .changed()
+            (
+              ui.label("email_min_submissions_per_letter") |
+              ui.add(egui::DragValue::new(&mut self.state.email_min_submissions_per_letter).speed(0.1)
+                .clamp_range(1..=1000)
+              )
+            ) .on_hover_text_at_pointer("Only send a letter if above or equal this threshold.\nDefault: 1")
+              .changed()
               .then(|| {
                 self.mailer.get()
                   .map(|m| m.env_settings.write().unwrap().email_min_submissions_per_letter
-                    = Some(self.email_min_submissions_per_letter));
+                    = Some(self.state.email_min_submissions_per_letter));
               });
+            ui.end_row();
           });
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(10.0);
+
+        ui.checkbox(&mut self.pupup_gui_settings, "🔧 GUI Settings");
+        ui.checkbox(&mut self.pupup_gui_inspection, "🔍 GUI Inspection");
+        ui.checkbox(&mut self.pupup_gui_memory, "📝 GUI Memory");
       });
   }
 }
@@ -312,12 +387,12 @@ impl eframe::App for GUI {
       ui.add_space(10.0);
 
       // subreddit filter
-      ui.checkbox(&mut self.subreddit_filter_enabled, "Subreddit")
+      ui.checkbox(&mut self.state.subreddit_filter_enabled, "Subreddit")
         .changed()
         .then(|| self.on_subreddit_filter_changed());
       ui.add_enabled_ui(
-        self.subreddit_filter_enabled,
-        |ui| ui.text_edit_singleline(&mut self.subreddit_filter)
+        self.state.subreddit_filter_enabled,
+        |ui| ui.text_edit_singleline(&mut self.state.subreddit_filter)
           .changed()
           .then(|| self.on_subreddit_filter_changed())
       );
@@ -325,12 +400,12 @@ impl eframe::App for GUI {
       ui.add_space(5.0);
 
       // title filter
-      ui.checkbox(&mut self.title_filter_enabled, "Title filter")
+      ui.checkbox(&mut self.state.title_filter_enabled, "Title filter")
         .changed()
         .then(|| self.on_title_filter_changed());
       ui.add_enabled_ui(
-        self.title_filter_enabled,
-        |ui| ui.text_edit_singleline(&mut self.title_filter)
+        self.state.title_filter_enabled,
+        |ui| ui.text_edit_singleline(&mut self.state.title_filter)
           .changed()
           .then(|| self.on_title_filter_changed())
       );
@@ -340,12 +415,12 @@ impl eframe::App for GUI {
       ui.add_space(10.0);
 
       // email
-      ui.checkbox(&mut self.email_enabled, "Send to email")
+      ui.checkbox(&mut self.state.email_enabled, "✉ Send to email")
         .changed()
         .then(|| self.on_email_checkbox_changed());
       ui.add_enabled_ui(
-        self.email_enabled,
-        |ui| ui.text_edit_singleline(&mut self.email_address)
+        self.state.email_enabled,
+        |ui| ui.text_edit_singleline(&mut self.state.email_address)
           .changed()
           .then(|| self.on_email_address_changed())
       );
@@ -355,6 +430,13 @@ impl eframe::App for GUI {
       ui.add_space(10.0);
 
       ui.checkbox(&mut self.popup_settings, "🔧 Extra settings");
+
+      ui.add_space(80.0);
+      self.texture.as_ref().map(|tex| {
+        ui.vertical_centered(|ui| {
+          ui.image(tex.texture_id(ctx), [128.0, 128.0])
+        })
+      });
     });
 
     egui::CentralPanel::default().show(ctx, |ui| {
@@ -362,6 +444,11 @@ impl eframe::App for GUI {
         self.format_posts(ui);
       });
     });
+  }
+
+  fn save(&mut self, storage: &mut dyn Storage) {
+    let Ok(json) = serde_json::to_string_pretty(&self.state) else { return };
+    storage.set_string("state", json);
   }
 }
 
@@ -391,7 +478,12 @@ pub fn submissions_thread(
               .push_overwrite(submission.clone());
 
             mailer.get()
-              .map(|m| m.add_submission_to_queue(submission.clone()));
+              .map(|m| {
+                m.env_settings.read().unwrap().notify_email
+                  .is_some().then(|| {
+                  m.add_submission_to_queue(submission.clone())
+                })
+              });
 
             tokio::time::sleep(Duration::from_millis(16)).await; // smooth scroll, can be removed
             on_new_post_callback(submission); // call ui thread to redraw post list

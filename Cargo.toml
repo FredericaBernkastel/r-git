@@ -2,16 +2,22 @@
 name = "r-gui"
 version = "0.1.0"
 edition = "2021"
+authors = ["Frederica Bernkastel <frederica.bernkastel0@gmail.com>"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-r = { path = "../r" }
+r = { git = "https://github.com/FredericaBernkastel/r.git", tag = "0.2.0" }
+# r = { path = "../r" }
 anyhow = "1"
 tokio = {version = "1", features = ["full"] }
 futures = "0.3"
-eframe = "0.22"
+eframe = {version = "0.22", features = ["persistence"] }
+egui_extras = {version = "0.22", features = ["image"]}
+image = { version = "0.24", features = ["jpeg", "png"] }
 ringbuf = "0.3"
 env_logger = "0.10"
 log = "0.4"
 regex = "1.9"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
